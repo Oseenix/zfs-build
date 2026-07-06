@@ -1,0 +1,95 @@
+name: Build OpenZFS 2.2.10
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          debhelper dh-python dh-sequence-dkms dkms \
+          libaio-dev libblkid-dev libcurl4-openssl-dev \
+          libelf-dev libpam0g-dev libssl-dev libtirpc-dev \
+          libtool libudev-dev lsb-release po-debconf \
+          python3-all-dev python3-cffi python3-setuptools python3-sphinx \
+          uuid-dev zlib1g-dev \
+          linux-headers-6.8.0-134-generic \
+          gcc-12 ccache zstd
+
+    - name: Setup ccache with gcc-12
+      run: |
+        sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 12
+        sudo update-alternatives --set gcc /usr/bin/gcc-12
+        echo "/usr/lib/ccache" >> $GITHUB_PATH
+
+    - name: Download source
+      run: |
+        wget -q https://github.com/openzfs/zfs/releases/download/zfs-2.2.10/zfs-2.2.10.tar.gz
+        tar xzf zfs-2.2.10.tar.gz
+
+    - name: Cache ccache
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: zfs-2.2.10-kmod-ccache-${{ runner.os }}-6.8.0-134
+
+    - name: Build deb packages (includes DKMS source)
+      run: |
+        export CCACHE_DIR=~/.ccache
+        ccache -M 2G
+        cd zfs-2.2.10
+        ./configure \
+          --with-linux=/usr/src/linux-headers-6.8.0-134-generic \
+          --with-linux-obj=/usr/src/linux-headers-6.8.0-134-generic
+        cp -r contrib/debian debian
+        DEB_BUILD_OPTIONS="nodoc nocheck parallel=$(nproc)" \
+          dpkg-buildpackage -us -uc -b -d
+
+    - name: ccache stats
+      run: ccache -s
+
+    - name: Compile kernel modules via DKMS
+      run: |
+        sudo dpkg -i openzfs-zfs-dkms_2.2.10-1_all.deb || true
+        sudo dkms build zfs/2.2.10 -k 6.8.0-134-generic
+        ls /var/lib/dkms/zfs/2.2.10/6.8.0-134-generic/x86_64/module/
+
+    - name: Package kernel modules (zstd-compressed, Ubuntu 24.04 style)
+      run: |
+        KVER=6.8.0-134-generic
+        MODDIR=/var/lib/dkms/zfs/2.2.10/${KVER}/x86_64/module
+        DESTDIR=kmod-pkg/lib/modules/${KVER}/updates/dkms
+        mkdir -p "$DESTDIR"
+
+        # Compress each .ko to .ko.zst — matches Ubuntu 24.04 kernel module format
+        # so initramfs-tools (dracut-install) picks them up correctly
+        for ko in ${MODDIR}/*.ko; do
+          zstd -19 -T0 "$ko" -o "${DESTDIR}/$(basename ${ko}).zst"
+        done
+
+        ls -lh "$DESTDIR"
+
+        mkdir -p kmod-pkg/DEBIAN
+        printf "Package: openzfs-zfs-modules-6.8.0-134-generic\nVersion: 2.2.10-1\nArchitecture: amd64\nMaintainer: local build\nDescription: OpenZFS 2.2.10 kernel modules for 6.8.0-134-generic (zstd)\n" \
+          > kmod-pkg/DEBIAN/control
+        dpkg-deb --build kmod-pkg openzfs-zfs-modules-6.8.0-134-generic_2.2.10-1_amd64.deb
+        ls -lh openzfs-zfs-modules-6.8.0-134-generic_2.2.10-1_amd64.deb
+
+    - name: Collect packages
+      run: |
+        mkdir debs
+        find . -maxdepth 1 -name "*.deb" -exec cp {} debs/ \;
+        ls -lh debs/
+
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: zfs-2.2.10-noble-6.8.0-134
+        path: debs/*.deb
+        retention-days: 7
